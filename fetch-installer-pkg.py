@@ -145,7 +145,7 @@ class ReplicationError(Exception):
 
 
 def replicate_url(full_url,
-                  root_dir='/tmp',
+                  dest="/tmp/InstallAssistant.pkg",
                   show_progress=False,
                   ignore_cache=False,
                   attempt_resume=False):
@@ -155,29 +155,37 @@ def replicate_url(full_url,
     path = urlsplit(full_url)[2]
     relative_url = path.lstrip('/')
     relative_url = os.path.normpath(relative_url)
-    local_file_path = os.path.join(root_dir, relative_url)
+
     if show_progress:
         options = '-fL'
     else:
         options = '-sfL'
-    curl_cmd = ['/usr/bin/curl', options,
-                '--create-dirs',
-                '-o', local_file_path]
+
+    curl_cmd = [
+        '/usr/bin/curl',
+        options,
+        '--create-dirs',
+        '-o',
+        dest
+    ]
+
     if not full_url.endswith(".gz"):
         # stupid hack for stupid Apple behavior where it sometimes returns
         # compressed files even when not asked for
         curl_cmd.append('--compressed')
-    if not ignore_cache and os.path.exists(local_file_path):
-        curl_cmd.extend(['-z', local_file_path])
-        if attempt_resume:
-            curl_cmd.extend(['-C', '-'])
+
+    if not ignore_cache and os.path.exists(dest):
+        curl_cmd.extend(['-C', '-'])
+
     curl_cmd.append(full_url)
     print("Downloading %s..." % full_url)
+
     try:
         subprocess.check_call(curl_cmd)
     except subprocess.CalledProcessError as err:
         raise ReplicationError(err)
-    return local_file_path
+
+    return dest
 
 
 def parse_server_metadata(filename):
@@ -339,7 +347,7 @@ def os_installer_product_info(catalog, workdir, ignore_cache=False):
                 product_info[product_key]['title'] = dist_info.get('title_from_dist')
             if not product_info[product_key]['version']:
                 product_info[product_key]['version'] = dist_info.get('VERSION')
-        
+
     return product_info
 
 
@@ -388,6 +396,10 @@ def main():
                         help='Ignore any previously cached files.')
     parser.add_argument('--latest', action='store_true',
                         help='Download the latest version with no user interaction.')
+    parser.add_argument('--open-with-finder', action='store_true',
+                        help='Open installer pkg with finder once complete.')
+    parser.add_argument('--show-progress', action='store_true',
+                        help='Show curl progress.')
     parser.add_argument('--version', default='',
                         help='Download the latest version with no user interaction.')
     args = parser.parse_args()
@@ -414,7 +426,7 @@ def main():
     # download sucatalog and look for products that are for macOS installers
     catalog = download_and_parse_sucatalog(
         su_catalog_url, args.workdir, ignore_cache=args.ignore_cache)
-    
+
     # print(catalog)
     product_info = os_installer_product_info(
         catalog, args.workdir, ignore_cache=args.ignore_cache)
@@ -430,7 +442,7 @@ def main():
               % ('#', 'ProductID', 'Version', 'Build', 'Post Date', 'Title'))
         # sort the list by release date
         sorted_product_info = sorted(product_info, key=lambda k: product_info[k]['PostDate'], reverse=True)
-        
+
         if args.latest:
             product_id = sorted_product_info[0]
         elif args.version:
@@ -466,9 +478,9 @@ def main():
         product_id = list(product_info.keys())[0]
         print("Found a single installer:")
 
-    
+
     product = catalog['Products'][product_id]
-    
+
     print('%14s %10s %8s %11s  %s' % (
         product_id,
         product_info[product_id].get('version', 'UNKNOWN'),
@@ -482,23 +494,17 @@ def main():
         package_url = package['URL']
         if package_url.endswith('InstallAssistant.pkg'):
             break
-    
+
     # print("Package URL is %s" % package_url)
-    download_pkg = replicate_url(package_url, args.workdir, True, ignore_cache=args.ignore_cache)
-    
     pkg_name = ('InstallAssistant-%s-%s.pkg' % (product_info[product_id]['version'],
                 product_info[product_id]['BUILD']))
-    
-    # hard link the downloaded file to cwd
-    local_pkg = os.path.join(args.workdir, pkg_name)
-    os.link(download_pkg, local_pkg)
-    
-    # unlink download
-    #os.unlink(download_pkg)
-    
-    # reveal in Finder
-    open_cmd = ['open', '-R', local_pkg]
-    subprocess.check_call(open_cmd)
+    downloaded_pkg = os.path.join(args.workdir, pkg_name)
+    replicate_url(package_url, dest=downloaded_pkg, show_progress=args.show_progress, ignore_cache=args.ignore_cache)
+
+    if args.open_with_finder:
+        # reveal in Finder
+        open_cmd = ['open', '-R', downloaded_pkg]
+        subprocess.check_call(open_cmd)
 
 
 if __name__ == '__main__':
