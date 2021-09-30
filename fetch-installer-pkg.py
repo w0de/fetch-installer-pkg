@@ -175,7 +175,7 @@ def replicate_url(
         curl_cmd.extend(["-C", "-"])
 
     curl_cmd.append(full_url)
-    print("Downloading %s..." % full_url)
+    print("Downloading %s from %s..." % (dest, full_url))
 
     try:
         subprocess.check_call(curl_cmd)
