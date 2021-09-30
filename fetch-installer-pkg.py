@@ -71,6 +71,8 @@ SEED_CATALOGS_PLIST = (
     'Resources/SeedCatalogs.plist'
 )
 
+WORKING_DIR = '/tmp'
+
 
 def get_input(prompt=None):
     '''Python 2 and 3 wrapper for raw_input/input'''
@@ -145,16 +147,20 @@ class ReplicationError(Exception):
 
 
 def replicate_url(full_url,
-                  dest="/tmp/InstallAssistant.pkg",
+                  dest=None,
                   show_progress=False,
                   ignore_cache=False,
                   attempt_resume=False):
     '''Downloads a URL and stores it in the same relative path on our
     filesystem. Returns a path to the replicated file.'''
 
-    path = urlsplit(full_url)[2]
-    relative_url = path.lstrip('/')
-    relative_url = os.path.normpath(relative_url)
+    if dest is None:
+        dest = os.path.normpath(
+            urlsplit(full_url)[2].lstrip('/')
+        )
+
+    if not dest.startswith("/"):
+        dest = os.path.join(WORKING_DIR, dest)
 
     if show_progress:
         options = '-fL'
@@ -212,13 +218,12 @@ def parse_server_metadata(filename):
     return metadata
 
 
-def get_server_metadata(catalog, product_key, workdir, ignore_cache=False):
+def get_server_metadata(catalog, product_key, ignore_cache=False):
     '''Replicate ServerMetaData'''
     try:
         url = catalog['Products'][product_key]['ServerMetadataURL']
         try:
-            smd_path = replicate_url(
-                url, root_dir=workdir, ignore_cache=ignore_cache)
+            smd_path = replicate_url(url, ignore_cache=ignore_cache)
             return smd_path
         except ReplicationError as err:
             print('Could not replicate %s: %s' % (url, err), file=sys.stderr)
@@ -271,11 +276,11 @@ def parse_dist(filename):
     return dist_info
 
 
-def download_and_parse_sucatalog(sucatalog, workdir, ignore_cache=False):
+def download_and_parse_sucatalog(sucatalog, ignore_cache=False):
     '''Downloads and returns a parsed softwareupdate catalog'''
     try:
         localcatalogpath = replicate_url(
-            sucatalog, root_dir=workdir, ignore_cache=ignore_cache)
+            sucatalog, ignore_cache=ignore_cache)
     except ReplicationError as err:
         print('Could not replicate %s: %s' % (sucatalog, err), file=sys.stderr)
         exit(-1)
@@ -315,13 +320,13 @@ def find_mac_os_installers(catalog, installassistant_pkg_only=False):
                 continue
     return mac_os_installer_products
 
-def os_installer_product_info(catalog, workdir, ignore_cache=False):
+def os_installer_product_info(catalog, ignore_cache=False):
     '''Returns a dict of info about products that look like macOS installers'''
     product_info = {}
     installer_products = find_mac_os_installers(catalog)
     for product_key in installer_products:
         product_info[product_key] = {}
-        filename = get_server_metadata(catalog, product_key, workdir)
+        filename = get_server_metadata(catalog, product_key)
         if filename:
             product_info[product_key] = parse_server_metadata(filename)
         else:
@@ -335,7 +340,7 @@ def os_installer_product_info(catalog, workdir, ignore_cache=False):
         dist_url = distributions.get('English') or distributions.get('en')
         try:
             dist_path = replicate_url(
-                dist_url, root_dir=workdir, show_progress=False, ignore_cache=ignore_cache)
+                dist_url, show_progress=False, ignore_cache=ignore_cache)
         except ReplicationError as err:
             print('Could not replicate %s: %s' % (dist_url, err),
                   file=sys.stderr)
@@ -351,7 +356,7 @@ def os_installer_product_info(catalog, workdir, ignore_cache=False):
     return product_info
 
 
-def replicate_product(catalog, product_id, workdir, ignore_cache=False):
+def replicate_product(catalog, product_id, ignore_cache=False):
     '''Downloads all the packages for a product'''
     product = catalog['Products'][product_id]
     for package in product.get('Packages', []):
@@ -361,7 +366,7 @@ def replicate_product(catalog, product_id, workdir, ignore_cache=False):
         if 'URL' in package:
             try:
                 replicate_url(
-                    package['URL'], root_dir=workdir,
+                    package['URL'],
                     show_progress=True, ignore_cache=ignore_cache,
                     attempt_resume=(not ignore_cache))
             except ReplicationError as err:
@@ -370,7 +375,7 @@ def replicate_product(catalog, product_id, workdir, ignore_cache=False):
                 exit(-1)
         if 'MetadataURL' in package:
             try:
-                replicate_url(package['MetadataURL'], root_dir=workdir,
+                replicate_url(package['MetadataURL'],
                               ignore_cache=ignore_cache)
             except ReplicationError as err:
                 print('Could not replicate %s: %s'
@@ -423,13 +428,16 @@ def main():
                   file=sys.stderr)
             exit(-1)
 
+    global WORKING_DIR
+    WORKING_DIR = args.workdir
+
     # download sucatalog and look for products that are for macOS installers
     catalog = download_and_parse_sucatalog(
-        su_catalog_url, args.workdir, ignore_cache=args.ignore_cache)
+        su_catalog_url, ignore_cache=args.ignore_cache)
 
     # print(catalog)
     product_info = os_installer_product_info(
-        catalog, args.workdir, ignore_cache=args.ignore_cache)
+        catalog, ignore_cache=args.ignore_cache)
 
     if not product_info:
         print('No macOS installer products found in the sucatalog.',
