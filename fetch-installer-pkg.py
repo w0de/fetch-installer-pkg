@@ -147,9 +147,22 @@ class ReplicationError(Exception):
     pass
 
 
-def replicate_url(
-    full_url, dest=None, show_progress=False, ignore_cache=False, attempt_resume=False
-):
+def content_length(url):
+    try:
+        output = subprocess.check_output(
+            ["/usr/bin/curl", "-X", "HEAD", "-i", "-fL", full_url]
+        )
+
+        for line in output.splitlines():
+            if line.strip().startswith("Content-Length:"):
+                return int(line.split(":")[-1].strip())
+
+        return None
+    except subprocess.CalledProcessError as err:
+        raise ReplicationError(err)
+
+
+def replicate_url(full_url, dest=None, show_progress=False, ignore_cache=False):
     """Downloads a URL and stores it in the same relative path on our
     filesystem. Returns a path to the replicated file."""
 
@@ -171,8 +184,19 @@ def replicate_url(
         # compressed files even when not asked for
         curl_cmd.append("--compressed")
 
+    if ignore_cache and os.path.exists(dest):
+        os.remove(dest)
+
     if not ignore_cache and os.path.exists(dest):
-        curl_cmd.extend(["-C", "-"])
+        remote_bytes = content_length(full_url)
+        cached_bytes = os.path.getsize(dest)
+        if remote_bytes == cached_bytes:
+            print("Skipping download: %s is cached." % (dest))
+            return dest
+        elif remote_bytes < cached_bytes:
+            os.remove(dest)
+        else:
+            curl_cmd.extend(["-C", "-"])
 
     curl_cmd.append(full_url)
     print("Downloading %s from %s..." % (dest, full_url))
@@ -546,12 +570,14 @@ def main():
         product_info[product_id]["version"],
         product_info[product_id]["BUILD"],
     )
+
     downloaded_pkg = os.path.join(args.workdir, pkg_name)
     replicate_url(
         package_url,
         dest=downloaded_pkg,
         show_progress=args.show_progress,
         ignore_cache=args.ignore_cache,
+        cache_check=True,
     )
 
     if args.open_with_finder:
