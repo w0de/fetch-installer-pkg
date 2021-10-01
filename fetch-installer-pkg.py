@@ -39,6 +39,7 @@ import os
 import plistlib
 import subprocess
 import sys
+import logging
 
 try:
     # python 2
@@ -72,6 +73,22 @@ SEED_CATALOGS_PLIST = (
 )
 
 WORKING_DIR = "/tmp"
+
+
+def get_logger():
+    logger = logging.getLogger(os.path.basename(__file__))
+    logger.setLevel(logging.DEBUG)
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    )
+    logger.addHandler(handler)
+
+    return logger
+
+
+log = get_logger()
 
 
 def get_input(prompt=None):
@@ -111,7 +128,7 @@ def get_seeding_program(sucatalog_url):
                 return key
         return ""
     except (OSError, IOError, ExpatError, AttributeError, KeyError) as err:
-        print(err, file=sys.stderr)
+        log.warn(err, file=sys.stderr)
         return ""
 
 
@@ -121,7 +138,7 @@ def get_seed_catalog(seedname="DeveloperSeed"):
         seed_catalogs = read_plist(SEED_CATALOGS_PLIST)
         return seed_catalogs.get(seedname)
     except (OSError, IOError, ExpatError, AttributeError, KeyError) as err:
-        print(err, file=sys.stderr)
+        log.warn(err, file=sys.stderr)
         return ""
 
 
@@ -131,7 +148,7 @@ def get_seeding_programs():
         seed_catalogs = read_plist(SEED_CATALOGS_PLIST)
         return list(seed_catalogs.keys())
     except (OSError, IOError, ExpatError, AttributeError, KeyError) as err:
-        print(err, file=sys.stderr)
+        log.warn(err, file=sys.stderr)
         return ""
 
 
@@ -147,10 +164,10 @@ class ReplicationError(Exception):
     pass
 
 
-def content_length(url):
+def content_length(full_url):
     try:
         output = subprocess.check_output(
-            ["/usr/bin/curl", "-X", "HEAD", "-i", "-fL", full_url]
+            ["/usr/bin/curl", "--head", "-i", "-fL", full_url]
         )
 
         for line in output.splitlines():
@@ -191,7 +208,7 @@ def replicate_url(full_url, dest=None, show_progress=False, ignore_cache=False):
         remote_bytes = content_length(full_url)
         cached_bytes = os.path.getsize(dest)
         if remote_bytes == cached_bytes:
-            print("Skipping download: %s is cached." % (dest))
+            log.info("Skipping download: %s is cached." % (dest))
             return dest
         elif remote_bytes < cached_bytes:
             os.remove(dest)
@@ -199,7 +216,7 @@ def replicate_url(full_url, dest=None, show_progress=False, ignore_cache=False):
             curl_cmd.extend(["-C", "-"])
 
     curl_cmd.append(full_url)
-    print("Downloading %s from %s..." % (dest, full_url))
+    log.info("Downloading %s from %s..." % (dest, full_url))
 
     try:
         subprocess.check_call(curl_cmd)
@@ -218,7 +235,7 @@ def parse_server_metadata(filename):
     try:
         md_plist = read_plist(filename)
     except (OSError, IOError, ExpatError) as err:
-        print("Error reading %s: %s" % (filename, err), file=sys.stderr)
+        log.error("Error reading %s: %s" % (filename, err), file=sys.stderr)
         return {}
     vers = md_plist.get("CFBundleShortVersionString", "")
     localization = md_plist.get("localization", {})
@@ -240,10 +257,10 @@ def get_server_metadata(catalog, product_key, ignore_cache=False):
             smd_path = replicate_url(url, ignore_cache=ignore_cache)
             return smd_path
         except ReplicationError as err:
-            print("Could not replicate %s: %s" % (url, err), file=sys.stderr)
+            log.warn("Could not replicate %s: %s" % (url, err), file=sys.stderr)
             return None
     except KeyError:
-        # print('Malformed catalog.', file=sys.stderr)
+        # log.info('Malformed catalog.', file=sys.stderr)
         return None
 
 
@@ -254,10 +271,10 @@ def parse_dist(filename):
     try:
         dom = minidom.parse(filename)
     except ExpatError:
-        print("Invalid XML in %s" % filename, file=sys.stderr)
+        log.warn("Invalid XML in %s" % filename, file=sys.stderr)
         return dist_info
     except IOError as err:
-        print("Error reading %s: %s" % (filename, err), file=sys.stderr)
+        log.warn("Error reading %s: %s" % (filename, err), file=sys.stderr)
         return dist_info
 
     titles = dom.getElementsByTagName("title")
@@ -297,7 +314,7 @@ def download_and_parse_sucatalog(sucatalog, ignore_cache=False):
     try:
         localcatalogpath = replicate_url(sucatalog, ignore_cache=ignore_cache)
     except ReplicationError as err:
-        print("Could not replicate %s: %s" % (sucatalog, err), file=sys.stderr)
+        log.error("Could not replicate %s: %s" % (sucatalog, err), file=sys.stderr)
         exit(-1)
     if os.path.splitext(localcatalogpath)[1] == ".gz":
         with gzip.open(localcatalogpath) as the_file:
@@ -306,14 +323,16 @@ def download_and_parse_sucatalog(sucatalog, ignore_cache=False):
                 catalog = read_plist_from_string(content)
                 return catalog
             except ExpatError as err:
-                print("Error reading %s: %s" % (localcatalogpath, err), file=sys.stderr)
+                log.info(
+                    "Error reading %s: %s" % (localcatalogpath, err), file=sys.stderr
+                )
                 exit(-1)
     else:
         try:
             catalog = read_plist(localcatalogpath)
             return catalog
         except (OSError, IOError, ExpatError) as err:
-            print("Error reading %s: %s" % (localcatalogpath, err), file=sys.stderr)
+            log.error("Error reading %s: %s" % (localcatalogpath, err), file=sys.stderr)
             exit(-1)
 
 
@@ -345,7 +364,7 @@ def os_installer_product_info(catalog, ignore_cache=False):
         if filename:
             product_info[product_key] = parse_server_metadata(filename)
         else:
-            print("No server metadata for %s" % product_key)
+            log.warn("No server metadata for %s" % product_key)
             product_info[product_key]["title"] = None
             product_info[product_key]["version"] = None
 
@@ -358,7 +377,7 @@ def os_installer_product_info(catalog, ignore_cache=False):
                 dist_url, show_progress=False, ignore_cache=ignore_cache
             )
         except ReplicationError as err:
-            print("Could not replicate %s: %s" % (dist_url, err), file=sys.stderr)
+            log.warn("Could not replicate %s: %s" % (dist_url, err), file=sys.stderr)
         else:
             dist_info = parse_dist(dist_path)
             product_info[product_key]["DistributionPath"] = dist_path
@@ -387,7 +406,7 @@ def replicate_product(catalog, product_id, ignore_cache=False):
                     attempt_resume=(not ignore_cache),
                 )
             except ReplicationError as err:
-                print(
+                log.error(
                     "Could not replicate %s: %s" % (package["URL"], err),
                     file=sys.stderr,
                 )
@@ -396,7 +415,7 @@ def replicate_product(catalog, product_id, ignore_cache=False):
             try:
                 replicate_url(package["MetadataURL"], ignore_cache=ignore_cache)
             except ReplicationError as err:
-                print(
+                log.error(
                     "Could not replicate %s: %s" % (package["MetadataURL"], err),
                     file=sys.stderr,
                 )
@@ -463,11 +482,11 @@ def main():
     elif args.seedprogram:
         su_catalog_url = get_seed_catalog(args.seedprogram)
         if not su_catalog_url:
-            print(
+            log.error(
                 "Could not find a catalog url for seed program %s" % args.seedprogram,
                 file=sys.stderr,
             )
-            print(
+            log.error(
                 "Valid seeding programs are: %s" % ", ".join(get_seeding_programs()),
                 file=sys.stderr,
             )
@@ -475,7 +494,7 @@ def main():
     else:
         su_catalog_url = get_default_catalog()
         if not su_catalog_url:
-            print(
+            log.error(
                 "Could not find a default catalog url for this OS version.",
                 file=sys.stderr,
             )
@@ -489,16 +508,18 @@ def main():
         su_catalog_url, ignore_cache=args.ignore_cache
     )
 
-    # print(catalog)
+    # log.info(catalog)
     product_info = os_installer_product_info(catalog, ignore_cache=args.ignore_cache)
 
     if not product_info:
-        print("No macOS installer products found in the sucatalog.", file=sys.stderr)
+        log.error(
+            "No macOS installer products found in the sucatalog.", file=sys.stderr
+        )
         exit(-1)
 
     if len(product_info) > 1:
         # display a menu of choices (some seed catalogs have multiple installers)
-        print(
+        log.info(
             "%2s %14s %10s %8s %11s  %s"
             % ("#", "ProductID", "Version", "Build", "Post Date", "Title")
         )
@@ -516,11 +537,11 @@ def main():
                     found_version = True
                     break
             if found_version != True:
-                print("Couldn't find version, Exiting.")
+                log.error("Couldn't find version, Exiting.")
                 exit(1)
         else:
             for index, product_id in enumerate(sorted_product_info):
-                print(
+                log.info(
                     "%2s %14s %10s %8s %11s  %s"
                     % (
                         index + 1,
@@ -540,15 +561,15 @@ def main():
                     raise ValueError
                 product_id = sorted_product_info[index]
             except (ValueError, IndexError):
-                print("Exiting.")
+                log.warn("Exiting.")
                 exit(0)
     else:  # only one product found
         product_id = list(product_info.keys())[0]
-        print("Found a single installer:")
+        log.info("Found a single installer:")
 
     product = catalog["Products"][product_id]
 
-    print(
+    log.info(
         "%14s %10s %8s %11s  %s"
         % (
             product_id,
@@ -565,7 +586,7 @@ def main():
         if package_url.endswith("InstallAssistant.pkg"):
             break
 
-    # print("Package URL is %s" % package_url)
+    # log.info("Package URL is %s" % package_url)
     pkg_name = "InstallAssistant-%s-%s.pkg" % (
         product_info[product_id]["version"],
         product_info[product_id]["BUILD"],
@@ -577,7 +598,6 @@ def main():
         dest=downloaded_pkg,
         show_progress=args.show_progress,
         ignore_cache=args.ignore_cache,
-        cache_check=True,
     )
 
     if args.open_with_finder:
