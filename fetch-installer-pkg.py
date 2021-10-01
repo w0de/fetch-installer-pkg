@@ -606,7 +606,7 @@ def main():
         subprocess.check_call(open_cmd)
 
     if args.write_receipt:
-        receipt = "fetched.%.installer.bom" % (product_info[product_id]["version"])
+        receipt = "fetched.%s.installer.bom" % (product_info[product_id]["version"])
         with open(os.path.join("/var/db/receipts", receipt), "wb+") as f:
             f.write("")
 
