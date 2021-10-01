@@ -421,6 +421,11 @@ def main():
         "--show-progress", action="store_true", help="Show curl progress."
     )
     parser.add_argument(
+        "--write-receipt",
+        action="store_true",
+        help="Write receipt on successful download.",
+    )
+    parser.add_argument(
         "--version",
         default="",
         help="Download the latest version with no user interaction.",
@@ -553,6 +558,11 @@ def main():
         # reveal in Finder
         open_cmd = ["open", "-R", downloaded_pkg]
         subprocess.check_call(open_cmd)
+
+    if args.write_receipt:
+        receipt = "fetched.%.installer.bom" % (product_info[product_id]["version"])
+        with open(os.path.join("/var/db/receipts", receipt), "wb+") as f:
+            f.write("")
 
 
 if __name__ == "__main__":
