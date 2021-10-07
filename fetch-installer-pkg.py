@@ -40,6 +40,7 @@ import plistlib
 import subprocess
 import sys
 import logging
+from datetime import datetime
 
 try:
     # python 2
@@ -128,7 +129,7 @@ def get_seeding_program(sucatalog_url):
                 return key
         return ""
     except (OSError, IOError, ExpatError, AttributeError, KeyError) as err:
-        log.warn(err, file=sys.stderr)
+        log.warn(err)
         return ""
 
 
@@ -138,7 +139,7 @@ def get_seed_catalog(seedname="DeveloperSeed"):
         seed_catalogs = read_plist(SEED_CATALOGS_PLIST)
         return seed_catalogs.get(seedname)
     except (OSError, IOError, ExpatError, AttributeError, KeyError) as err:
-        log.warn(err, file=sys.stderr)
+        log.warn(err)
         return ""
 
 
@@ -148,7 +149,7 @@ def get_seeding_programs():
         seed_catalogs = read_plist(SEED_CATALOGS_PLIST)
         return list(seed_catalogs.keys())
     except (OSError, IOError, ExpatError, AttributeError, KeyError) as err:
-        log.warn(err, file=sys.stderr)
+        log.warn(err)
         return ""
 
 
@@ -167,7 +168,7 @@ class ReplicationError(Exception):
 def content_length(full_url):
     try:
         output = subprocess.check_output(
-            ["/usr/bin/curl", "--head", "-i", "-fL", full_url]
+            ["/usr/bin/curl", "--silent", "--head", "-i", "-fL", full_url]
         )
 
         for line in output.splitlines():
@@ -194,6 +195,7 @@ def replicate_url(full_url, dest=None, show_progress=False, ignore_cache=False):
     else:
         options = "-sfL"
 
+    filename = dest.split("/")[-1]
     curl_cmd = ["/usr/bin/curl", options, "--create-dirs", "-o", dest]
 
     if not full_url.endswith(".gz"):
@@ -208,15 +210,20 @@ def replicate_url(full_url, dest=None, show_progress=False, ignore_cache=False):
         remote_bytes = content_length(full_url)
         cached_bytes = os.path.getsize(dest)
         if remote_bytes == cached_bytes:
-            log.info("Skipping download: %s is cached." % (dest))
+            log.info("%s is cached - skipping download." % (filename))
             return dest
         elif remote_bytes < cached_bytes:
             os.remove(dest)
         else:
+            log.info(
+                "%s is partially cached - resuming download from %s..."
+                % (filename, full_url)
+            )
             curl_cmd.extend(["-C", "-"])
+    else:
+        log.info("%s is required - downloading from %s..." % (filename, full_url))
 
     curl_cmd.append(full_url)
-    log.info("Downloading %s from %s..." % (dest, full_url))
 
     try:
         subprocess.check_call(curl_cmd)
@@ -235,7 +242,7 @@ def parse_server_metadata(filename):
     try:
         md_plist = read_plist(filename)
     except (OSError, IOError, ExpatError) as err:
-        log.error("Error reading %s: %s" % (filename, err), file=sys.stderr)
+        log.error("Error reading %s: %s" % (filename, err))
         return {}
     vers = md_plist.get("CFBundleShortVersionString", "")
     localization = md_plist.get("localization", {})
@@ -257,10 +264,10 @@ def get_server_metadata(catalog, product_key, ignore_cache=False):
             smd_path = replicate_url(url, ignore_cache=ignore_cache)
             return smd_path
         except ReplicationError as err:
-            log.warn("Could not replicate %s: %s" % (url, err), file=sys.stderr)
+            log.warn("Could not replicate %s: %s" % (url, err))
             return None
     except KeyError:
-        # log.info('Malformed catalog.', file=sys.stderr)
+        # log.info('Malformed catalog.')
         return None
 
 
@@ -271,10 +278,10 @@ def parse_dist(filename):
     try:
         dom = minidom.parse(filename)
     except ExpatError:
-        log.warn("Invalid XML in %s" % filename, file=sys.stderr)
+        log.warn("Invalid XML in %s" % filename)
         return dist_info
     except IOError as err:
-        log.warn("Error reading %s: %s" % (filename, err), file=sys.stderr)
+        log.warn("Error reading %s: %s" % (filename, err))
         return dist_info
 
     titles = dom.getElementsByTagName("title")
@@ -314,8 +321,8 @@ def download_and_parse_sucatalog(sucatalog, ignore_cache=False):
     try:
         localcatalogpath = replicate_url(sucatalog, ignore_cache=ignore_cache)
     except ReplicationError as err:
-        log.error("Could not replicate %s: %s" % (sucatalog, err), file=sys.stderr)
-        exit(-1)
+        log.error("Could not replicate %s: %s" % (sucatalog, err))
+        sys.exit(1)
     if os.path.splitext(localcatalogpath)[1] == ".gz":
         with gzip.open(localcatalogpath) as the_file:
             content = the_file.read()
@@ -323,41 +330,59 @@ def download_and_parse_sucatalog(sucatalog, ignore_cache=False):
                 catalog = read_plist_from_string(content)
                 return catalog
             except ExpatError as err:
-                log.info(
-                    "Error reading %s: %s" % (localcatalogpath, err), file=sys.stderr
-                )
-                exit(-1)
+                log.info("Error reading %s: %s" % (localcatalogpath, err))
+                sys.exit(1)
     else:
         try:
             catalog = read_plist(localcatalogpath)
             return catalog
         except (OSError, IOError, ExpatError) as err:
-            log.error("Error reading %s: %s" % (localcatalogpath, err), file=sys.stderr)
-            exit(-1)
+            log.error("Error reading %s: %s" % (localcatalogpath, err))
+            sys.exit(1)
 
 
-def find_mac_os_installers(catalog, installassistant_pkg_only=False):
+def get_installassistant_pkgs(product):
+    with_auto = filter(
+        lambda pkg: pkg["URL"].endswith("InstallAssistant.pkg")
+        or pkg["URL"].endswith("InstallAssistantAuto.pkg"),
+        filter(lambda pkg: pkg.get("URL"), product["Packages"]),
+    )
+
+    return (
+        filter(lambda pkg: pkg["URL"].endswith("InstallAssistant.pkg"), with_auto)
+        or with_auto
+    )
+
+
+def find_mac_os_installers(
+    catalog, shared_support_only=False, pkg_installers_only=False
+):
     """Return a list of product identifiers for what appear to be macOS
     installers"""
     mac_os_installer_products = []
     if "Products" in catalog:
         for product_key in catalog["Products"].keys():
             product = catalog["Products"][product_key]
-            try:
-                if product["ExtendedMetaInfo"]["InstallAssistantPackageIdentifiers"]:
-                    if product["ExtendedMetaInfo"][
-                        "InstallAssistantPackageIdentifiers"
-                    ]["SharedSupport"]:
-                        mac_os_installer_products.append(product_key)
-            except KeyError:
+            installassistant_ids = product.get("ExtendedMetaInfo", {}).get(
+                "InstallAssistantPackageIdentifiers"
+            )
+            if installassistant_ids is None:
                 continue
+
+            if (
+                installassistant_ids.get("SharedSupport") or not shared_support_only
+            ) and (get_installassistant_pkgs(product) or not pkg_installers_only):
+                mac_os_installer_products.append(product_key)
+
     return mac_os_installer_products
 
 
-def os_installer_product_info(catalog, ignore_cache=False):
+def os_installer_product_info(catalog, ignore_cache=False, pkg_installers_only=False):
     """Returns a dict of info about products that look like macOS installers"""
     product_info = {}
-    installer_products = find_mac_os_installers(catalog)
+    installer_products = find_mac_os_installers(
+        catalog, pkg_installers_only=pkg_installers_only
+    )
     for product_key in installer_products:
         product_info[product_key] = {}
         filename = get_server_metadata(catalog, product_key)
@@ -377,7 +402,8 @@ def os_installer_product_info(catalog, ignore_cache=False):
                 dist_url, show_progress=False, ignore_cache=ignore_cache
             )
         except ReplicationError as err:
-            log.warn("Could not replicate %s: %s" % (dist_url, err), file=sys.stderr)
+            raise "fugger"
+            log.warn("Could not replicate %s: %s" % (dist_url, err))
         else:
             dist_info = parse_dist(dist_path)
             product_info[product_key]["DistributionPath"] = dist_path
@@ -390,7 +416,7 @@ def os_installer_product_info(catalog, ignore_cache=False):
     return product_info
 
 
-def replicate_product(catalog, product_id, ignore_cache=False):
+def replicate_product(catalog, product_id, show_progress=False, ignore_cache=False):
     """Downloads all the packages for a product"""
     product = catalog["Products"][product_id]
     for package in product.get("Packages", []):
@@ -401,25 +427,278 @@ def replicate_product(catalog, product_id, ignore_cache=False):
             try:
                 replicate_url(
                     package["URL"],
-                    show_progress=True,
+                    show_progress=show_progress,
                     ignore_cache=ignore_cache,
-                    attempt_resume=(not ignore_cache),
                 )
             except ReplicationError as err:
-                log.error(
-                    "Could not replicate %s: %s" % (package["URL"], err),
-                    file=sys.stderr,
-                )
-                exit(-1)
+                log.error("Could not replicate %s: %s" % (package["URL"], err))
+                sys.exit(1)
         if "MetadataURL" in package:
             try:
                 replicate_url(package["MetadataURL"], ignore_cache=ignore_cache)
             except ReplicationError as err:
-                log.error(
-                    "Could not replicate %s: %s" % (package["MetadataURL"], err),
-                    file=sys.stderr,
-                )
-                exit(-1)
+                log.error("Could not replicate %s: %s" % (package["MetadataURL"], err))
+                sys.exit(1)
+
+
+def interactive_product_selection(options, product_info):
+    def select_product_id(raw_answer):
+        if not raw_answer:
+            return None
+
+        try:
+            index = int(raw_answer) - 1
+            assert index > 0
+            return options[index]
+        except (ValueError, IndexError, AssertionError):
+            print("Invalid selection. Please try again.")
+            return None
+
+    print(
+        "%2s %14s %10s %8s %11s  %s"
+        % ("#", "ProductID", "Version", "Build", "Post Date", "Title")
+    )
+    for index, product_id in enumerate(options):
+        print(
+            "%2s %14s %10s %8s %11s  %s"
+            % (
+                index + 1,
+                product_id,
+                product_info[product_id].get("version", "UNKNOWN"),
+                product_info[product_id].get("BUILD", "UNKNOWN"),
+                product_info[product_id]["PostDate"].strftime("%Y-%m-%d"),
+                product_info[product_id]["title"],
+            )
+        )
+
+    product_id = None
+    while product_id is None:
+        product_id = select_product_id(
+            get_input("\nChoose a product to download (1-%s): " % len(product_info))
+        )
+
+    return product_id
+
+
+def install_product(dist_path, target_vol):
+    """Install a product to a target volume.
+    Returns a boolean to indicate success or failure."""
+    # set CM_BUILD env var to make Installer bypass eligibilty checks
+    # when installing packages (for machine-specific OS builds)
+    os.environ["CM_BUILD"] = "CM_BUILD"
+    cmd = ["/usr/sbin/installer", "-pkg", dist_path, "-target", target_vol]
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError as err:
+        log.warn(err)
+        return False
+    else:
+        # Apple postinstall script bug ends up copying files to a path like
+        # /tmp/dmg.T9ak1HApplications
+        path = target_vol + "Applications"
+        if os.path.exists(path):
+            log.info("Working around a very dumb Apple bug")
+            subprocess.check_call(
+                ["/usr/bin/ditto", path, os.path.join(target_vol, "Applications")]
+            )
+            subprocess.check_call(["/bin/rm", "-r", path])
+        return True
+
+
+def make_sparse_image(volume_name, output_path):
+    """Make a sparse disk image we can install a product to"""
+    cmd = [
+        "/usr/bin/hdiutil",
+        "create",
+        "-size",
+        "16g",
+        "-fs",
+        "HFS+",
+        "-volname",
+        volume_name,
+        "-type",
+        "SPARSE",
+        "-plist",
+        output_path,
+    ]
+    try:
+        output = subprocess.check_output(cmd)
+    except subprocess.CalledProcessError as err:
+        log.error(err)
+        sys.exit(1)
+    try:
+        return read_plist_from_string(output)[0]
+    except IndexError as err:
+        log.error("Unexpected output from hdiutil: %s" % output)
+        sys.exit(1)
+    except ExpatError as err:
+        log.error("Malformed output from hdiutil: %s" % output)
+        log.error(err)
+        sys.exit(1)
+
+
+def mountdmg(dmgpath):
+    """
+    Attempts to mount the dmg at dmgpath and returns first mountpoint
+    """
+    mountpoints = []
+    dmgname = os.path.basename(dmgpath)
+    cmd = [
+        "/usr/bin/hdiutil",
+        "attach",
+        dmgpath,
+        "-mountRandom",
+        "/tmp",
+        "-nobrowse",
+        "-plist",
+        "-owners",
+        "on",
+    ]
+    proc = subprocess.Popen(
+        cmd, bufsize=-1, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    (pliststr, err) = proc.communicate()
+    if proc.returncode:
+        log.error('Error: "%s" while mounting %s.' % (err, dmgname))
+        return None
+    if pliststr:
+        plist = read_plist_from_string(pliststr)
+        for entity in plist["system-entities"]:
+            if "mount-point" in entity:
+                mountpoints.append(entity["mount-point"])
+
+    return mountpoints[0]
+
+
+def unmountdmg(mountpoint):
+    """
+    Unmounts the dmg at mountpoint
+    """
+    proc = subprocess.Popen(
+        ["/usr/bin/hdiutil", "detach", mountpoint],
+        bufsize=-1,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    (dummy_output, err) = proc.communicate()
+    if proc.returncode:
+        log.warn("Polite unmount failed: %s" % err)
+        log.warn("Attempting to force unmount %s" % mountpoint)
+        # try forcing the unmount
+        retcode = subprocess.call(["/usr/bin/hdiutil", "detach", mountpoint, "-force"])
+        if retcode:
+            log.warn("Failed to unmount %s" % mountpoint)
+
+
+def find_installer_app(mountpoint):
+    """Returns the path to the Install macOS app on the mountpoint"""
+    applications_dir = os.path.join(mountpoint, "Applications")
+    for item in os.listdir(applications_dir):
+        if item.endswith(".app"):
+            return os.path.join(applications_dir, item)
+    return None
+
+
+def make_compressed_dmg(app_path, diskimagepath):
+    """Returns path to newly-created compressed r/o disk image containing
+    Install macOS.app"""
+
+    cmd = [
+        "/usr/bin/hdiutil",
+        "create",
+        "-fs",
+        "HFS+",
+        "-srcfolder",
+        app_path,
+        diskimagepath,
+    ]
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError as err:
+        log.warn(err)
+    else:
+        log.info("Disk image created at: %s" % diskimagepath)
+
+
+def installinstallmacos(
+    catalog, product_id, product_info, show_progress=False, ignore_cache=False
+):
+    macos_version = product_info.get("version", "UNKNOWN")
+    volname = "Install_macOS_%s-%s" % (
+        macos_version,
+        product_info["BUILD"],
+    )
+    downloaded_artifact = os.path.join(WORKING_DIR, volname + ".dmg")
+    if os.path.exists(downloaded_artifact):
+        if ignore_cache:
+            print("whoops would have removed")
+            sys.exit(1)
+            os.remove(downloaded_artifact)
+        else:
+            log.info(
+                "Read-only compressed dmg containing installer app is already cached."
+            )
+            return downloaded_artifact
+
+    replicate_product(
+        catalog,
+        product_id,
+        show_progress=show_progress,
+        ignore_cache=ignore_cache,
+    )
+
+    sparse_diskimage_path = os.path.join(WORKING_DIR, volname + ".sparseimage")
+    if os.path.exists(sparse_diskimage_path):
+        os.unlink(sparse_diskimage_path)
+
+    log.info("Making empty sparseimage...")
+    sparse_diskimage_path = make_sparse_image(volname, sparse_diskimage_path)
+
+    mountpoint = mountdmg(sparse_diskimage_path)
+    if not mountpoint or not os.path.exists(mountpoint):
+        log.error("Failed to mount downloaded diskimage!")
+        sys.exit(1)
+
+    try:
+        err = None
+        log.info("Installing product to mounted image...")
+        success = install_product(product_info["DistributionPath"], mountpoint)
+        if not success:
+            log.error("Product installation failed.")
+            sys.exit(1)
+
+        installer_app = find_installer_app(mountpoint)
+        if not installer_app:
+            log.error("No installer .app found in downloaded artifact!")
+            sys.exit(1)
+
+        seeding_program = get_seeding_program(su_catalog_url)
+        if seeding_program:
+            log.info(
+                "Adding seeding program %s extended attribute to app" % seeding_program
+            )
+            xattr.setxattr(installer_app, "SeedProgram", seeding_program)
+
+        if os.path.exists(downloaded_artifact):
+            os.remove(downloaded_artifact)
+
+        log.info(
+            "Creating read-only compressed dmg containing %s..."
+            % (os.path.basename(installer_app))
+        )
+        make_compressed_dmg(installer_app, downloaded_artifact)
+    except Exception as err:
+        log.error("Unexpected error:")
+        log.error(err)
+    except SystemExit as err:
+        print("Goodbye!")
+    finally:
+        unmountdmg(mountpoint)
+        os.unlink(sparse_diskimage_path)
+        if err:
+            sys.exit(1)
+
+    return downloaded_artifact
 
 
 def main():
@@ -471,7 +750,12 @@ def main():
     parser.add_argument(
         "--version",
         default="",
-        help="Download the latest version with no user interaction.",
+        help="Only find installers for version. With --latest, download the latest for version.",
+    )
+    parser.add_argument(
+        "--pkg-installers-only",
+        action="store_true",
+        help="Only consider and download macOS installers with a full InstallAssistant.pkg. If false, .dmg installers are also considered for download.",
     )
     args = parser.parse_args()
 
@@ -490,7 +774,7 @@ def main():
                 "Valid seeding programs are: %s" % ", ".join(get_seeding_programs()),
                 file=sys.stderr,
             )
-            exit(-1)
+            sys.exit(1)
     else:
         su_catalog_url = get_default_catalog()
         if not su_catalog_url:
@@ -498,10 +782,12 @@ def main():
                 "Could not find a default catalog url for this OS version.",
                 file=sys.stderr,
             )
-            exit(-1)
+            sys.exit(1)
 
     global WORKING_DIR
     WORKING_DIR = args.workdir
+
+    log.info("Searching catalog: " + su_catalog_url)
 
     # download sucatalog and look for products that are for macOS installers
     catalog = download_and_parse_sucatalog(
@@ -509,106 +795,118 @@ def main():
     )
 
     # log.info(catalog)
-    product_info = os_installer_product_info(catalog, ignore_cache=args.ignore_cache)
+    product_info = os_installer_product_info(
+        catalog,
+        ignore_cache=args.ignore_cache,
+        pkg_installers_only=args.pkg_installers_only,
+    )
 
-    if not product_info:
+    # sort the list by release date
+    sorted_product_info = filter(
+        lambda pid: not args.version or product_info[pid]["version"] == args.version,
+        sorted(product_info, key=lambda k: product_info[k]["PostDate"], reverse=True),
+    )
+
+    if not sorted_product_info:
         log.error(
-            "No macOS installer products found in the sucatalog.", file=sys.stderr
+            "No macOS installer products found in the sucatalog for version: "
+            + args.version
+            if args.version
+            else "any"
         )
-        exit(-1)
+        sys.exit(1)
 
-    if len(product_info) > 1:
-        # display a menu of choices (some seed catalogs have multiple installers)
-        log.info(
-            "%2s %14s %10s %8s %11s  %s"
-            % ("#", "ProductID", "Version", "Build", "Post Date", "Title")
-        )
-        # sort the list by release date
-        sorted_product_info = sorted(
-            product_info, key=lambda k: product_info[k]["PostDate"], reverse=True
-        )
+    log.info("Found %s installers." % (str(len(product_info))))
 
-        if args.latest:
-            product_id = sorted_product_info[0]
-        elif args.version:
-            found_version = False
-            for index, product_id in enumerate(sorted_product_info):
-                if product_info[product_id]["version"] == args.version:
-                    found_version = True
-                    break
-            if found_version != True:
-                log.error("Couldn't find version, Exiting.")
-                exit(1)
-        else:
-            for index, product_id in enumerate(sorted_product_info):
-                log.info(
-                    "%2s %14s %10s %8s %11s  %s"
-                    % (
-                        index + 1,
-                        product_id,
-                        product_info[product_id].get("version", "UNKNOWN"),
-                        product_info[product_id].get("BUILD", "UNKNOWN"),
-                        product_info[product_id]["PostDate"].strftime("%Y-%m-%d"),
-                        product_info[product_id]["title"],
-                    )
-                )
-            answer = get_input(
-                "\nChoose a product to download (1-%s): " % len(product_info)
-            )
-            try:
-                index = int(answer) - 1
-                if index < 0:
-                    raise ValueError
-                product_id = sorted_product_info[index]
-            except (ValueError, IndexError):
-                log.warn("Exiting.")
-                exit(0)
-    else:  # only one product found
-        product_id = list(product_info.keys())[0]
-        log.info("Found a single installer:")
+    if args.latest or len(sorted_product_info) == 1:
+        product_id = sorted_product_info[0]
+    else:
+        product_id = interactive_product_selection(sorted_product_info, product_info)
 
-    product = catalog["Products"][product_id]
+    selected_product_info = product_info[product_id]
+    macos_version = selected_product_info.get("version", "UNKNOWN")
 
     log.info(
-        "%14s %10s %8s %11s  %s"
+        "Selected installer: %14s %10s %8s %11s  %s"
         % (
             product_id,
-            product_info[product_id].get("version", "UNKNOWN"),
-            product_info[product_id].get("BUILD", "UNKNOWN"),
-            product_info[product_id]["PostDate"].strftime("%Y-%m-%d"),
-            product_info[product_id]["title"],
+            macos_version,
+            selected_product_info.get("BUILD", "UNKNOWN"),
+            selected_product_info["PostDate"].strftime("%Y-%m-%d"),
+            selected_product_info["title"],
         )
     )
 
     # determine the InstallAssistant pkg url
-    for package in product["Packages"]:
-        package_url = package["URL"]
-        if package_url.endswith("InstallAssistant.pkg"):
-            break
+    package_url = get_installassistant_pkgs(catalog["Products"][product_id])[0]["URL"]
 
-    # log.info("Package URL is %s" % package_url)
-    pkg_name = "InstallAssistant-%s-%s.pkg" % (
-        product_info[product_id]["version"],
-        product_info[product_id]["BUILD"],
-    )
+    if package_url.endswith("InstallAssistantAuto.pkg"):
+        artifact_type = "dmg"
 
-    downloaded_pkg = os.path.join(args.workdir, pkg_name)
-    replicate_url(
-        package_url,
-        dest=downloaded_pkg,
-        show_progress=args.show_progress,
-        ignore_cache=args.ignore_cache,
-    )
+        if args.pkg_installers_only:
+            log.error(
+                "Specified macOS installer does not have standalone InstallAssistant.pkg, and --pkg-installers-only was specified. Will not installinstallmacos. Exiting."
+            )
+            sys.exit(1)
+
+        downloaded_artifact = installinstallmacos(
+            catalog,
+            product_id,
+            selected_product_info,
+            show_progress=args.show_progress,
+            ignore_cache=args.ignore_cache,
+        )
+
+    else:
+        artifact_type = "pkg"
+        pkg_name = "InstallAssistant-%s-%s.pkg" % (
+            macos_version,
+            selected_product_info["BUILD"],
+        )
+
+        downloaded_artifact = os.path.join(WORKING_DIR, pkg_name)
+
+        replicate_url(
+            package_url,
+            dest=downloaded_artifact,
+            show_progress=args.show_progress,
+            ignore_cache=args.ignore_cache,
+        )
+
+    if not os.path.exists(downloaded_artifact):
+        log.error(downloaded_artifact + " was not found! Something went quite wrong.")
+        sys.exit(1)
+
+    log.info("Cached %s installer at %s." % (artifact_type, downloaded_artifact))
 
     if args.open_with_finder:
         # reveal in Finder
-        open_cmd = ["open", "-R", downloaded_pkg]
+        open_cmd = ["open", "-R", downloaded_artifact]
         subprocess.check_call(open_cmd)
 
     if args.write_receipt:
-        receipt = "fetched.%s.installer.bom" % (product_info[product_id]["version"])
-        with open(os.path.join("/var/db/receipts", receipt), "wb+") as f:
+        receipt = "org.macadmins.fetched.macos.installer.%s" % (macos_version)
+        bom = os.path.join("/var/db/receipts", receipt + ".bom")
+        plist = os.path.join("/var/db/receipts", receipt + ".plist")
+
+        receipt_metadata = {
+            "InstallDate": str(datetime.now()),
+            "InstallPrefixPath": WORKING_DIR,
+            "InstallProcessName": "fetch-macos-installer.py",
+            "PackageFileName": downloaded_artifact,
+            "PackageVersion": macos_version
+        }
+
+        with open(bom, "wb+") as f:
             f.write("")
+
+        with open(plist, "wb+") as f:
+            try:
+                plistlib.writePlist(receipt_metadata, f)
+            except AttributeError:
+                plistlib.dump(receipt_metadata, f)
+
+    sys.exit(0)
 
 
 if __name__ == "__main__":
