@@ -40,6 +40,7 @@ import plistlib
 import subprocess
 import sys
 import logging
+import json
 from datetime import datetime
 
 try:
@@ -180,15 +181,20 @@ def content_length(full_url):
         raise ReplicationError(err)
 
 
-def replicate_url(full_url, dest=None, show_progress=False, ignore_cache=False):
+def replicate_url(
+    full_url, dest=None, default_workdir=None, show_progress=False, ignore_cache=False
+):
     """Downloads a URL and stores it in the same relative path on our
     filesystem. Returns a path to the replicated file."""
+
+    if default_workdir is None:
+        default_workdir = WORKING_DIR
 
     if dest is None:
         dest = os.path.normpath(urlsplit(full_url)[2].lstrip("/"))
 
     if not dest.startswith("/"):
-        dest = os.path.join(WORKING_DIR, dest)
+        dest = os.path.join(default_workdir, dest)
 
     if show_progress:
         options = "-fL"
@@ -402,7 +408,6 @@ def os_installer_product_info(catalog, ignore_cache=False, pkg_installers_only=F
                 dist_url, show_progress=False, ignore_cache=ignore_cache
             )
         except ReplicationError as err:
-            raise "fugger"
             log.warn("Could not replicate %s: %s" % (dist_url, err))
         else:
             dist_info = parse_dist(dist_path)
@@ -419,6 +424,7 @@ def os_installer_product_info(catalog, ignore_cache=False, pkg_installers_only=F
 def replicate_product(catalog, product_id, show_progress=False, ignore_cache=False):
     """Downloads all the packages for a product"""
     product = catalog["Products"][product_id]
+
     for package in product.get("Packages", []):
         # TO-DO: Check 'Size' attribute and make sure
         # we have enough space on the target
@@ -435,7 +441,10 @@ def replicate_product(catalog, product_id, show_progress=False, ignore_cache=Fal
                 sys.exit(1)
         if "MetadataURL" in package:
             try:
-                replicate_url(package["MetadataURL"], ignore_cache=ignore_cache)
+                replicate_url(
+                    package["MetadataURL"],
+                    ignore_cache=ignore_cache,
+                )
             except ReplicationError as err:
                 log.error("Could not replicate %s: %s" % (package["MetadataURL"], err))
                 sys.exit(1)
@@ -448,7 +457,7 @@ def interactive_product_selection(options, product_info):
 
         try:
             index = int(raw_answer) - 1
-            assert index > 0
+            assert index >= 0
             return options[index]
         except (ValueError, IndexError, AssertionError):
             print("Invalid selection. Please try again.")
@@ -474,7 +483,7 @@ def interactive_product_selection(options, product_info):
     product_id = None
     while product_id is None:
         product_id = select_product_id(
-            get_input("\nChoose a product to download (1-%s): " % len(product_info))
+            get_input("\nChoose a product to download (1-%s): " % len(options))
         )
 
     return product_id
@@ -621,7 +630,12 @@ def make_compressed_dmg(app_path, diskimagepath):
 
 
 def installinstallmacos(
-    catalog, product_id, product_info, show_progress=False, ignore_cache=False
+    catalog,
+    su_catalog_url,
+    product_id,
+    product_info,
+    show_progress=False,
+    ignore_cache=False,
 ):
     macos_version = product_info.get("version", "UNKNOWN")
     volname = "Install_macOS_%s-%s" % (
@@ -631,8 +645,6 @@ def installinstallmacos(
     downloaded_artifact = os.path.join(WORKING_DIR, volname + ".dmg")
     if os.path.exists(downloaded_artifact):
         if ignore_cache:
-            print("whoops would have removed")
-            sys.exit(1)
             os.remove(downloaded_artifact)
         else:
             log.info(
@@ -678,9 +690,6 @@ def installinstallmacos(
                 "Adding seeding program %s extended attribute to app" % seeding_program
             )
             xattr.setxattr(installer_app, "SeedProgram", seeding_program)
-
-        if os.path.exists(downloaded_artifact):
-            os.remove(downloaded_artifact)
 
         log.info(
             "Creating read-only compressed dmg containing %s..."
@@ -841,16 +850,18 @@ def main():
     package_url = get_installassistant_pkgs(catalog["Products"][product_id])[0]["URL"]
 
     if package_url.endswith("InstallAssistantAuto.pkg"):
-        artifact_type = "dmg"
-
         if args.pkg_installers_only:
             log.error(
                 "Specified macOS installer does not have standalone InstallAssistant.pkg, and --pkg-installers-only was specified. Will not installinstallmacos. Exiting."
             )
             sys.exit(1)
 
+        artifact_type = "dmg"
+        expected_size = 0
+
         downloaded_artifact = installinstallmacos(
             catalog,
+            su_catalog_url,
             product_id,
             selected_product_info,
             show_progress=args.show_progress,
@@ -865,6 +876,7 @@ def main():
         )
 
         downloaded_artifact = os.path.join(WORKING_DIR, pkg_name)
+        expected_size = content_length(package_url)
 
         replicate_url(
             package_url,
@@ -873,38 +885,57 @@ def main():
             ignore_cache=args.ignore_cache,
         )
 
-    if not os.path.exists(downloaded_artifact):
-        log.error(downloaded_artifact + " was not found! Something went quite wrong.")
+    log.info("Cached %s installer at %s." % (artifact_type, downloaded_artifact))
+
+    receipt = "org.macadmins.fetched.macos.installer.%s" % (macos_version)
+    receipt_path = os.path.join("/var/db/receipts", receipt + ".bom")
+    metadata_path = os.path.join("/opt/gusto/macos-installers", receipt + ".plist")
+    old_metadata_path = os.path.join("/var/db/receipts", receipt + ".plist")
+
+    if os.path.exists(old_metadata_path):
+        os.remove(old_metadata_path)
+
+    # we arbitrarily expect the artifact to be at least 5gb otherwise we assume something broke
+    if (
+        not os.path.exists(downloaded_artifact)
+        or os.path.getsize(downloaded_artifact) < 5368709120
+    ):
+        if os.path.exists(metadata_path):
+            os.remove(metadata_path)
+
+        if os.path.exists(receipt_path):
+            os.remove(receipt_path)
+
+        log.error(
+            downloaded_artifact
+            + " was not found or is too small! Something went quite wrong."
+        )
         sys.exit(1)
 
-    log.info("Cached %s installer at %s." % (artifact_type, downloaded_artifact))
+    if args.write_receipt:
+        metadata = {
+            "CacheDate": str(datetime.now()),
+            "InstallPrefixPath": WORKING_DIR,
+            "InstallProcessName": "fetch-macos-installer.py",
+            "ArtifactFileName": downloaded_artifact,
+            "PackageVersion": macos_version,
+            "ArtifactType": artifact_type,
+            "ArtifactSize": expected_size,
+        }
+
+        with open(receipt_path, "wb+") as f:
+            f.write("")
+
+        try:
+            plistlib.writePlist(metadata, metadata_path)
+        except AttributeError:
+            with open(metadata_path, "wb+") as f:
+                plistlib.dump(metadata, f)
 
     if args.open_with_finder:
         # reveal in Finder
         open_cmd = ["open", "-R", downloaded_artifact]
         subprocess.check_call(open_cmd)
-
-    if args.write_receipt:
-        receipt = "org.macadmins.fetched.macos.installer.%s" % (macos_version)
-        bom = os.path.join("/var/db/receipts", receipt + ".bom")
-        plist = os.path.join("/var/db/receipts", receipt + ".plist")
-
-        receipt_metadata = {
-            "InstallDate": str(datetime.now()),
-            "InstallPrefixPath": WORKING_DIR,
-            "InstallProcessName": "fetch-macos-installer.py",
-            "PackageFileName": downloaded_artifact,
-            "PackageVersion": macos_version
-        }
-
-        with open(bom, "wb+") as f:
-            f.write("")
-
-        with open(plist, "wb+") as f:
-            try:
-                plistlib.writePlist(receipt_metadata, f)
-            except AttributeError:
-                plistlib.dump(receipt_metadata, f)
 
     sys.exit(0)
 
